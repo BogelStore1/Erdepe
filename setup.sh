@@ -1,95 +1,284 @@
-#!/bin/bash
-echo "Windows Installer by Team Therr0rs"
-echo
-echo "Pilih OS yang ingin anda install"
-echo "[1] Windows 2019 (Default)"
-echo "[2] Windows 2016"
-echo "[3] Windows 2012"
-echo "[4) Windows 10"
-echo "[5] Custom Link Zip (GZ)"
+#!/usr/bin/env bash
+set -euo pipefail
 
-read -p "Pilih [1]: " PILIH OS
+#############################################
+# Windows DD + FirstBoot Injector (DO KVM)
+# - Auto-detect IP/GW/DNS on Linux
+# - wget .gz image, dd to disk
+# - mount NTFS windows partition
+# - inject SetupComplete.bat + firstboot.ps1 + AutoExtendAllDisk.bat
+#############################################
 
-case "$PILIHOS" in
-1|"") PILIHOS="https://nixpoin.sgp1.cdn.digitaloceanspaces.com/windows2019DO.gz";;
-2) PILIHOS="https://nixpoin.sgp1.cdn.digitaloceanspaces.com/windows2016.gz";;
-3) PILIHOS="https://nixpoin.sgp1.cdn.digitaloceanspaces.com/windows2012v2.gz";;
-4) PILIHOS="https://image.yha.my.id/2:/windows10.gz";;
-5) read -p "[?] Link ZIP (GZ) : " PILIHOS;;
-*) echo "[!] Pilihan salah"; exit;;
-esac
+### ===== USER SETTINGS (EDIT) =====
+IMAGE_URL="https://image.yha.my.id/2:/windows10.gz"
 
-read -p "[?] Password Administrator (Minimal 12 Karakter) : " PASSADMIN
+TARGET_DISK="/dev/vda"      # DO biasanya /dev/vda
+RDP_PORT="9980"
+ADMIN_PASSWORD="Bogelganteng123!"
 
-IP4=$(curl -4 -s icanhazip.com)
-GW=$(ip route | awk '/default/ { print $3 }')
+# network: "dhcp" (disarankan DO) atau "static"
+NET_MODE="dhcp"
 
-cat >/tmp/net.bat<<EOF
-@ECHO OFF
-cd.>%windir%\GetAdmin
-if exist %windir%\GetAdmin (del /f /q "%windir%\GetAdmin") else (
-echo CreateObject^("Shell.Application"^).ShellExecute "%~s0", "%*", "", "runas", 1 >> "%temp%\Admin.vbs"
-"%temp%\Admin.vbs"
-del /f /q "%temp%\Admin.vbs"
-exit /b 2)
-net user Administrator $PASSADMIN
+# Safety switch: harus YES biar jalan
+FORCE="${FORCE:-NO}"
+### =================================
 
-for /f "tokens=3*" %%i in ('netsh interface show interface ^|findstr /I /R "Local.* Ethernet Ins*"') do (set InterfaceName=%%j)
-netsh -c interface ip set address name="Ethernet Instance 0" source=static address=$IP4 mask=255.255.240.0 gateway=$GW
-netsh -c interface ip add dnsservers name="Ethernet Instance 0" address=8.8.8.8 index=1 validate=no
-netsh -c interface ip add dnsservers name="Ethernet Instance 0" address=8.8.4.4 index=2 validate=no
+log(){ echo -e "[$(date -Is)] $*"; }
+die(){ echo -e "ERROR: $*" >&2; exit 1; }
 
-cd /d "%ProgramData%/Microsoft/Windows/Start Menu/Programs/Startup"
-del /f /q net.bat
-exit
-EOF
+need_root(){ [[ "${EUID}" -eq 0 ]] || die "Jalankan sebagai root."; }
 
-cat >/tmp/dpart.bat<<EOF
-@ECHO OFF
-echo CREATING IP WITH PORT $IP4:7890
-echo NOTE : TYPE YES AND ENTER
+install_deps(){
+  log "Install dependency..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y wget pv gzip qemu-utils ntfs-3g util-linux dos2unix
+}
 
-cd.>%windir%\GetAdmin
-if exist %windir%\GetAdmin (del /f /q "%windir%\GetAdmin") else (
-echo CreateObject^("Shell.Application"^).ShellExecute "%~s0", "%*", "", "runas", 1 >> "%temp%\Admin.vbs"
-"%temp%\Admin.vbs"
-del /f /q "%temp%\Admin.vbs"
-exit /b 2)
+preflight(){
+  need_root
+  [[ "$FORCE" == "YES" ]] || die "Safety stop. Jalankan dengan: FORCE=YES bash $0"
 
-set PORT=7890
-set RULE_NAME="Open Port %PORT%"
+  [[ -b "$TARGET_DISK" ]] || die "TARGET_DISK tidak ada: $TARGET_DISK"
 
-netsh advfirewall firewall show rule name=%RULE_NAME% >nul
-if not ERRORLEVEL 1 (
-rem Rule %RULE_NAME% already exists.
-echo Hey, you already got a out rule by that name, you cannot put another one in!
-) else (
-echo Rule %RULE_NAME% does not exist. Creating...
-netsh advfirewall firewall add rule name=%RULE_NAME% dir=in action=allow protocol=TCP localport=%PORT%
-)
+  if [[ "${#ADMIN_PASSWORD}" -lt 12 ]]; then
+    die "ADMIN_PASSWORD minimal 12 karakter."
+  fi
 
-reg add "HKLM\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v PortNumber /t REG_DWORD /d 7890
+  if ! [[ "$RDP_PORT" =~ ^[0-9]+$ ]] || (( RDP_PORT < 1 || RDP_PORT > 65535 )); then
+    die "RDP_PORT invalid: $RDP_PORT"
+  fi
 
-ECHO SELECT VOLUME=%%SystemDrive%% > "%SystemDrive%\diskpart.extend"
-ECHO EXTEND >> "%SystemDrive%\diskpart.extend"
-START /WAIT DISKPART /S "%SystemDrive%\diskpart.extend"
+  if [[ "$NET_MODE" != "dhcp" && "$NET_MODE" != "static" ]]; then
+    die "NET_MODE harus 'dhcp' atau 'static'"
+  fi
 
-del /f /q "%SystemDrive%\diskpart.extend"
-cd /d "%ProgramData%/Microsoft/Windows/Start Menu/Programs/Startup"
-del /f /q dpart.bat
-timeout 50 >nul
-del /f /q ChromeSetup.exe
-echo JENDELA INI JANGAN DITUTUP
-exit
-EOF
+  log "TARGET_DISK = $TARGET_DISK (AKAN DI-OVERWRITE!)"
+  lsblk "$TARGET_DISK" || true
+}
 
-wget --no-check-certificate -O- $PILIHOS | gunzip | dd of=/dev/vda bs=3M status=progress
+detect_network(){
+  log "Auto-detect network (Linux)..."
 
-mount.ntfs-3g /dev/vda2 /mnt
-cd "/mnt/ProgramData/Microsoft/Windows/Start Menu/Programs/"
-cd Start* || cd start*; \
-wget https://nixpoin.com/ChromeSetup.exe
-cp -f /tmp/net.bat net.bat
-cp -f /tmp/dpart.bat dpart.bat
+  # Default interface (via default route)
+  local def_if
+  def_if="$(ip -o -4 route show to default | awk '{print $5}' | head -n1 || true)"
+  [[ -n "${def_if:-}" ]] || die "Gagal detect default interface (ip route default)."
 
-echo "REBOOT DROPL
+  # IP/prefix
+  local ip_cidr
+  ip_cidr="$(ip -o -4 addr show dev "$def_if" | awk '{print $4}' | head -n1 || true)"
+  [[ -n "${ip_cidr:-}" ]] || die "Gagal detect IPv4 di interface $def_if."
+
+  local ipaddr prefix
+  ipaddr="${ip_cidr%/*}"
+  prefix="${ip_cidr#*/}"
+
+  # Gateway
+  local gateway
+  gateway="$(ip -o -4 route show to default | awk '{print $3}' | head -n1 || true)"
+  [[ -n "${gateway:-}" ]] || gateway=""
+
+  # DNS dari resolv.conf (ambil 2 pertama)
+  local dns1 dns2
+  dns1="$(awk '/^nameserver[[:space:]]+/ {print $2}' /etc/resolv.conf | head -n1 || true)"
+  dns2="$(awk '/^nameserver[[:space:]]+/ {print $2}' /etc/resolv.conf | sed -n '2p' || true)"
+
+  # fallback kalau kosong
+  [[ -n "${dns1:-}" ]] || dns1="1.1.1.1"
+  [[ -n "${dns2:-}" ]] || dns2="8.8.8.8"
+
+  export DET_IF="$def_if" DET_IP="$ipaddr" DET_PREFIX="$prefix" DET_GW="$gateway" DET_DNS1="$dns1" DET_DNS2="$dns2"
+
+  log "Detected: IF=$DET_IF IP=$DET_IP/$DET_PREFIX GW=$DET_GW DNS=$DET_DNS1,$DET_DNS2"
+}
+
+download_image(){
+  mkdir -p /tmp/win-dd
+  cd /tmp/win-dd
+  log "Download image: $IMAGE_URL"
+  wget -O windows.gz "$IMAGE_URL"
+  log "Downloaded: $(ls -lh windows.gz | awk '{print $5}')"
+}
+
+dd_image(){
+  cd /tmp/win-dd
+  log "Mulai dd ke $TARGET_DISK (INI MENGHAPUS DISK!)"
+  sync
+  pv windows.gz | gunzip -c | dd of="$TARGET_DISK" bs=16M status=progress conv=fsync
+  sync
+  log "DD selesai."
+}
+
+refresh_partitions(){
+  log "Refresh partition table..."
+  partprobe "$TARGET_DISK" || true
+  udevadm settle || true
+  sleep 2
+  lsblk -f "$TARGET_DISK" || true
+}
+
+find_windows_ntfs_partition(){
+  # Pilih partisi NTFS terbesar (paling sering adalah C:)
+  local part
+  part="$(lsblk -lnpo NAME,FSTYPE,SIZE "$TARGET_DISK" \
+    | awk '$2=="ntfs"{print $1" "$3}' \
+    | sort -hrk2 \
+    | head -n1 \
+    | awk '{print $1}')"
+
+  [[ -n "${part:-}" ]] || die "Tidak menemukan partisi NTFS pada $TARGET_DISK setelah dd."
+  echo "$part"
+}
+
+inject_scripts(){
+  local winpart="$1"
+  local mnt="/mnt/win"
+  local scripts_dir
+
+  log "Mount Windows partition: $winpart -> $mnt"
+  mkdir -p "$mnt"
+  mount -t ntfs-3g -o rw,uid=0,gid=0 "$winpart" "$mnt"
+
+  scripts_dir="$mnt/Windows/Setup/Scripts"
+  mkdir -p "$scripts_dir"
+
+  # SetupComplete.bat (bukan .cmd)
+  cat > "$scripts_dir/SetupComplete.bat" <<'BAT'
+@echo off
+REM === SetupComplete.bat runs at end of Windows setup (if image is generalized/sysprepped) ===
+
+REM Run first-boot PowerShell
+powershell -NoProfile -ExecutionPolicy Bypass -File "%WINDIR%\Setup\Scripts\firstboot.ps1"
+
+REM Auto-extend disk/partition
+call "%WINDIR%\Setup\Scripts\AutoExtendAllDisk.bat"
+
+exit /b 0
+BAT
+
+  # AutoExtendAllDisk.bat
+  # Extend C: to maximum supported size
+  cat > "$scripts_dir/AutoExtendAllDisk.bat" <<'BAT'
+@echo off
+setlocal
+
+REM Extend system partition (C:) to maximum size
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$ErrorActionPreference='SilentlyContinue';" ^
+  "$dl='C';" ^
+  "$p=Get-Partition -DriveLetter $dl;" ^
+  "if($p){$s=Get-PartitionSupportedSize -DriveLetter $dl; Resize-Partition -DriveLetter $dl -Size $s.SizeMax;}" ^
+  "exit 0"
+
+endlocal
+exit /b 0
+BAT
+
+  # firstboot.ps1: set password, RDP, port, firewall, network
+  # Pakai NET_MODE (dhcp/static). Kalau static, pakai hasil detect dari Linux (DET_*)
+  cat > "$scripts_dir/firstboot.ps1" <<PS1
+\$ErrorActionPreference = "Stop"
+
+# === Injected config ===
+\$AdminPassword = "${ADMIN_PASSWORD}"
+\$RdpPort = ${RDP_PORT}
+
+\$NetMode = "${NET_MODE}"     # dhcp / static
+\$IpAddr = "${DET_IP}"
+\$PrefixLen = ${DET_PREFIX}
+\$Gateway = "${DET_GW}"
+\$Dns1 = "${DET_DNS1}"
+\$Dns2 = "${DET_DNS2}"
+
+Write-Host "== Firstboot start =="
+
+# Set Administrator password
+try {
+  net user Administrator "\$AdminPassword" | Out-Null
+  Write-Host "Administrator password set."
+} catch {
+  Write-Host "Failed setting password: \$($_.Exception.Message)"
+}
+
+# Enable RDP
+try {
+  reg add "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f | Out-Null
+  Write-Host "RDP enabled."
+} catch {
+  Write-Host "Failed enabling RDP: \$($_.Exception.Message)"
+}
+
+# Set RDP port
+try {
+  reg add "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Terminal Server\\WinStations\\RDP-Tcp" /v PortNumber /t REG_DWORD /d \$RdpPort /f | Out-Null
+  Write-Host "RDP port set to \$RdpPort."
+} catch {
+  Write-Host "Failed setting RDP port: \$($_.Exception.Message)"
+}
+
+# Firewall allow RDP custom port
+try {
+  netsh advfirewall firewall add rule name="RDP Custom Port" dir=in action=allow protocol=TCP localport=\$RdpPort | Out-Null
+  Write-Host "Firewall rule added for TCP \$RdpPort."
+} catch {
+  Write-Host "Failed adding firewall rule: \$($_.Exception.Message)"
+}
+
+# Network configuration
+try {
+  \$adapter = Get-NetAdapter | Where-Object { \$_.Status -eq "Up" } | Select-Object -First 1
+  if (-not \$adapter) { throw "No active network adapter found." }
+
+  if (\$NetMode -eq "dhcp") {
+    Write-Host "Setting DHCP on adapter: \$((\$adapter).Name)"
+    Set-NetIPInterface -InterfaceIndex \$adapter.ifIndex -Dhcp Enabled | Out-Null
+    Set-DnsClientServerAddress -InterfaceIndex \$adapter.ifIndex -ResetServerAddresses | Out-Null
+  } else {
+    Write-Host "Setting STATIC IP on adapter: \$((\$adapter).Name) => \$IpAddr/\$PrefixLen gw \$Gateway"
+    Get-NetIPAddress -InterfaceIndex \$adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:\$false -ErrorAction SilentlyContinue
+    if (\$Gateway -and \$Gateway.Length -gt 0) {
+      New-NetIPAddress -InterfaceIndex \$adapter.ifIndex -IPAddress \$IpAddr -PrefixLength \$PrefixLen -DefaultGateway \$Gateway | Out-Null
+    } else {
+      New-NetIPAddress -InterfaceIndex \$adapter.ifIndex -IPAddress \$IpAddr -PrefixLength \$PrefixLen | Out-Null
+    }
+    Set-DnsClientServerAddress -InterfaceIndex \$adapter.ifIndex -ServerAddresses @(\$Dns1,\$Dns2) | Out-Null
+  }
+  Write-Host "Network configured (\$NetMode)."
+} catch {
+  Write-Host "Network config failed: \$($_.Exception.Message)"
+}
+
+Write-Host "== Firstboot done. Rebooting in 10 seconds =="
+Start-Sleep -Seconds 10
+Restart-Computer -Force
+PS1
+
+  # Convert to DOS line endings for bat (lebih aman)
+  if command -v unix2dos >/dev/null 2>&1; then
+    unix2dos -q "$scripts_dir/SetupComplete.bat" "$scripts_dir/AutoExtendAllDisk.bat" || true
+  fi
+
+  sync
+  umount "$mnt"
+  log "Inject selesai: SetupComplete.bat + firstboot.ps1 + AutoExtendAllDisk.bat"
+}
+
+main(){
+  preflight
+  install_deps
+  detect_network
+  download_image
+  dd_image
+  refresh_partitions
+  local winpart
+  winpart="$(find_windows_ntfs_partition)"
+  inject_scripts "$winpart"
+
+  log "SELESAI."
+  log "Next: Power Off/On droplet dari panel DO (atau reboot)."
+  log "RDP: IP droplet, port ${RDP_PORT}"
+  log "Net mode: ${NET_MODE} (detected IP/GW/DNS injected for static mode)."
+}
+
+main "$@"
